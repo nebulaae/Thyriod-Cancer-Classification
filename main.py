@@ -1,283 +1,792 @@
-import os
-import glob
-import pandas as pd
+"""
+Multimodal Thyroid PTC vs Benign Classification
+Unified Pipeline: Audit → Split → Train → Evaluate → Explain
+"""
+
+import os, glob, time, warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import seaborn as sns
 from PIL import Image
-from tqdm.auto import tqdm
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
+
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score, matthews_corrcoef, confusion_matrix, roc_curve, precision_recall_curve
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, accuracy_score,
+    f1_score, matthews_corrcoef, confusion_matrix,
+    roc_curve, precision_recall_curve, brier_score_loss,
+    balanced_accuracy_score, cohen_kappa_score
+)
+from sklearn.calibration import calibration_curve
 
-# ==========================================
-# 1. Configuration & Device Setup
-# ==========================================
-SEED = 42
-EPOCHS = 20
-LR = 1e-4
-BATCH_SIZE = 8
-IMG_SIZE = 224
+# ──────────────────────────────────────────────
+# 0. CONFIG
+# ──────────────────────────────────────────────
+CFG = dict(
+    seed        = 42,
+    n_folds     = 5,
+    fold_id     = 0,          # which fold to run as main experiment
+    epochs      = 10,
+    lr          = 3e-5,       # lower LR → less overfitting
+    weight_decay= 1e-3,
+    batch_size  = 2,
+    img_size    = 224,
+    dim         = 512,        # reduced dim → less overfitting
+    depth       = 1,          # 1 transformer layer → less overfitting
+    heads       = 8,
+    dropout     = 0.4,        # heavy dropout
+    label_smooth= 0.05,       # label smoothing
+    patience    = 12,         # early stopping patience
+    max_patches = 7,
+    checkpoint_dir = 'checkpoints',
+    graphs_dir     = 'graphs',
+    # Dataset dirs
+    benign_us_dir   = 'dataset2',
+    benign_path_dir = 'dataset1',
+    ptc_us_dir      = 'dataset3',
+    ptc_path_dir    = 'dataset4',
+)
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+torch.manual_seed(CFG['seed'])
+np.random.seed(CFG['seed'])
+os.makedirs(CFG['checkpoint_dir'], exist_ok=True)
+os.makedirs(CFG['graphs_dir'], exist_ok=True)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+print(f"Device: {device}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# ==========================================
-# 2. Data Audit & Preprocessing
-# ==========================================
-def audit_and_split(n_splits=5):
-    print("--- Stage 1: Data Audit & Splitting ---")
-    benign_us_dir = 'dataset2'
-    benign_path_dir = 'dataset1'
-    ptc_us_dir = 'dataset3'
-    ptc_path_dir = 'dataset4'
 
-    def get_patient_ids(directory, is_pathology=False):
+# ──────────────────────────────────────────────
+# 1. DATA AUDIT & METADATA
+# ──────────────────────────────────────────────
+def build_metadata(cfg) -> pd.DataFrame:
+    print("\n=== Stage 1: Data Audit & Metadata ===")
+
+    def get_ids(directory, is_pathology=False):
         ids = set()
-        for filename in os.listdir(directory):
-            if is_pathology: patient_id = filename.split('_')[0]
-            else: patient_id = os.path.splitext(filename)[0]
-            ids.add(patient_id)
+        for fn in os.listdir(directory):
+            ids.add(fn.split('_')[0] if is_pathology else os.path.splitext(fn)[0])
         return ids
 
-    benign_us_ids = get_patient_ids(benign_us_dir)
-    ptc_us_ids = get_patient_ids(ptc_us_dir)
-    benign_path_ids = get_patient_ids(benign_path_dir, is_pathology=True)
-    ptc_path_ids = get_patient_ids(ptc_path_dir, is_pathology=True)
+    b_us  = get_ids(cfg['benign_us_dir'])
+    b_p   = get_ids(cfg['benign_path_dir'], True)
+    ptc_us = get_ids(cfg['ptc_us_dir'])
+    ptc_p  = get_ids(cfg['ptc_path_dir'], True)
 
-    data = []
-    # Benign
-    for pid in sorted(list(benign_us_ids), key=int):
-        if pid in benign_path_ids:
-            us_path = glob.glob(os.path.join(benign_us_dir, f"{pid}.*"))[0]
-            path_patches = sorted(glob.glob(os.path.join(benign_path_dir, f"{pid}_*.tif")))
-            data.append({'patient_id': f'benign_{pid}', 'label': 0, 'us_path': us_path, 'path_patches': ';'.join(path_patches), 'num_patches': len(path_patches)})
-    
-    # PTC
-    for pid in sorted(list(ptc_us_ids), key=int):
-        if pid in ptc_path_ids:
-            us_path = glob.glob(os.path.join(ptc_us_dir, f"{pid}.*"))[0]
-            path_patches = sorted(glob.glob(os.path.join(ptc_path_dir, f"{pid}_*.tif")))
-            data.append({'patient_id': f'ptc_{pid}', 'label': 1, 'us_path': us_path, 'path_patches': ';'.join(path_patches), 'num_patches': len(path_patches)})
+    print(f"Benign US ids: {len(b_us)}, Path ids: {len(b_p)}")
+    print(f"PTC    US ids: {len(ptc_us)}, Path ids: {len(ptc_p)}")
+    overlap = b_us & ptc_us
+    if overlap:
+        print(f"WARNING — ID overlap Benign/PTC in US: {overlap}")
 
-    df = pd.DataFrame(data)
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+    rows = []
+    for label, us_dir, p_dir, us_ids, p_ids in [
+        (0, cfg['benign_us_dir'], cfg['benign_path_dir'], b_us, b_p),
+        (1, cfg['ptc_us_dir'],    cfg['ptc_path_dir'],    ptc_us, ptc_p),
+    ]:
+        class_name = 'benign' if label == 0 else 'ptc'
+        for pid in sorted(us_ids & p_ids, key=int):
+            us_files = glob.glob(os.path.join(us_dir, f"{pid}.*"))
+            patches  = sorted(glob.glob(os.path.join(p_dir, f"{pid}_*.tif")))
+            if not us_files or not patches:
+                continue
+            rows.append({
+                'patient_id': f'{class_name}_{pid}',
+                'original_id': pid,
+                'label': label,
+                'us_path': us_files[0],
+                'patch_paths': ';'.join(patches),
+                'num_patches': len(patches),
+            })
+
+    df = pd.DataFrame(rows)
+    print(f"\nPaired patients → Benign: {(df.label==0).sum()}, PTC: {(df.label==1).sum()}, Total: {len(df)}")
+
+    outliers = df[(df.num_patches < 3) | (df.num_patches > 7)]
+    if not outliers.empty:
+        print(f"WARNING — {len(outliers)} patients outside 3-7 patch range")
+
+    # Stratified K-Fold (patient-level — no leakage)
+    skf = StratifiedKFold(n_splits=cfg['n_folds'], shuffle=True, random_state=cfg['seed'])
     df['fold'] = -1
     for fold, (_, val_idx) in enumerate(skf.split(df, df['label'])):
         df.loc[val_idx, 'fold'] = fold
-    
-    # Plot distribution
-    plt.figure(figsize=(10, 4), dpi=100)
-    plt.subplot(1, 2, 1)
-    sns.countplot(data=df, x='label', hue='label', palette='viridis', legend=False)
-    plt.title("Class Distribution")
-    plt.xticks([0, 1], ['Benign', 'PTC'])
-    
-    plt.subplot(1, 2, 2)
-    sns.histplot(data=df, x='num_patches', bins=6, kde=True, color='teal')
-    plt.title("Patches per Patient")
-    plt.tight_layout()
-    plt.savefig('data_distribution.png')
-    plt.show()
-    
+
+    print("Fold distribution:")
+    for f in range(cfg['n_folds']):
+        fd = df[df.fold == f]
+        print(f"  Fold {f}: {len(fd)} pts | Benign={( fd.label==0).sum()} PTC={(fd.label==1).sum()}")
+
+    df.to_csv('metadata.csv', index=False)
+    print("Saved metadata.csv")
+    _plot_data_audit(df, cfg)
     return df
 
-# ==========================================
-# 3. Dataset & Model Definitions
-# ==========================================
-class MultimodalDataset(Dataset):
-    def __init__(self, df, us_transform=None, path_transform=None):
-        self.df = df
-        self.us_transform = us_transform
-        self.path_transform = path_transform
+
+def _plot_data_audit(df, cfg):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Class distribution
+    counts = df['label'].value_counts().rename({0: 'Benign', 1: 'PTC'})
+    axes[0].bar(counts.index, counts.values, color=['#4C9BE8', '#E86B4C'], edgecolor='k', linewidth=0.5)
+    axes[0].set_title('Class Distribution', fontsize=12)
+    axes[0].set_ylabel('Patients')
+    for i, v in enumerate(counts.values):
+        axes[0].text(i, v + 1, str(v), ha='center', fontsize=11)
+
+    # Patch count distribution
+    axes[1].hist(df['num_patches'], bins=range(3, 10), color='#4C9BE8', edgecolor='k', linewidth=0.5, align='left')
+    axes[1].set_title('Patches per Patient', fontsize=12)
+    axes[1].set_xlabel('# patches')
+    axes[1].set_ylabel('Patients')
+    axes[1].set_xticks(range(3, 8))
+
+    # Fold balance
+    fold_data = df.groupby('fold')['label'].value_counts().unstack().fillna(0)
+    fold_data.columns = ['Benign', 'PTC']
+    fold_data.plot(kind='bar', ax=axes[2], color=['#4C9BE8', '#E86B4C'], edgecolor='k', linewidth=0.5)
+    axes[2].set_title('Class Balance per Fold', fontsize=12)
+    axes[2].set_xlabel('Fold')
+    axes[2].tick_params(axis='x', rotation=0)
+    axes[2].legend()
+
+    plt.tight_layout()
+    path = os.path.join(cfg['graphs_dir'], 'data_audit.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+# ──────────────────────────────────────────────
+# 2. DATASET & COLLATE
+# ──────────────────────────────────────────────
+class ThyroidDataset(Dataset):
+    def __init__(self, df, us_tf=None, path_tf=None):
+        self.df = df.reset_index(drop=True)
+        self.us_tf   = us_tf
+        self.path_tf = path_tf
 
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         us_img = Image.open(row['us_path']).convert('RGB')
-        if self.us_transform: us_img = self.us_transform(us_img)
-        
-        patch_paths = row['path_patches'].split(';')
-        patches = [self.path_transform(Image.open(p).convert('RGB')) for p in patch_paths]
-        
-        return {'us': us_img, 'path': torch.stack(patches), 'label': torch.tensor(row['label'], dtype=torch.long), 'id': row['patient_id']}
+        if self.us_tf:
+            us_img = self.us_tf(us_img)
+
+        patches = []
+        for p in row['patch_paths'].split(';'):
+            img = Image.open(p).convert('RGB')
+            if self.path_tf:
+                img = self.path_tf(img)
+            patches.append(img)
+
+        return {
+            'us':       us_img,
+            'patches':  torch.stack(patches),
+            'n_patches': len(patches),
+            'label':    torch.tensor(row['label'], dtype=torch.float32),
+            'pid':      row['patient_id'],
+        }
+
 
 def collate_fn(batch):
-    us = torch.stack([x['us'] for x in batch])
-    labels = torch.stack([x['label'] for x in batch])
-    max_p = max([x['path'].shape[0] for x in batch])
-    padded_path, masks = [], []
-    for x in batch:
-        p = x['path']
-        count = p.shape[0]
-        mask = torch.zeros(max_p, dtype=torch.bool)
-        mask[:count] = 1
-        padding = torch.zeros((max_p - count, *p.shape[1:]), dtype=p.dtype)
-        padded_path.append(torch.cat([p, padding], dim=0))
-        masks.append(mask)
-    return {'us': us, 'path': torch.stack(padded_path), 'mask': torch.stack(masks), 'label': labels}
+    us      = torch.stack([x['us'] for x in batch])
+    labels  = torch.stack([x['label'] for x in batch])
+    max_p   = max(x['n_patches'] for x in batch)
 
+    padded, masks = [], []
+    for x in batch:
+        p = x['patches']
+        n = x['n_patches']
+        pad = torch.zeros((max_p - n, *p.shape[1:]), dtype=p.dtype)
+        padded.append(torch.cat([p, pad], dim=0))
+        mask = torch.zeros(max_p, dtype=torch.bool)
+        mask[:n] = True
+        masks.append(mask)
+
+    return {
+        'us':     us,
+        'path':   torch.stack(padded),
+        'mask':   torch.stack(masks),
+        'labels': labels,
+        'pids':   [x['pid'] for x in batch],
+    }
+
+
+def get_transforms(cfg, augment=False):
+    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    sz   = cfg['img_size']
+    if augment:
+        us_tf = transforms.Compose([
+            transforms.Resize((sz, sz)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.ToTensor(), norm,
+        ])
+        path_tf = transforms.Compose([
+            transforms.Resize((sz, sz)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(90),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            transforms.ToTensor(), norm,
+        ])
+    else:
+        us_tf = path_tf = transforms.Compose([
+            transforms.Resize((sz, sz)),
+            transforms.ToTensor(), norm,
+        ])
+    return us_tf, path_tf
+
+
+# ──────────────────────────────────────────────
+# 3. MODEL
+# ──────────────────────────────────────────────
 class PatchEncoder(nn.Module):
-    def __init__(self):
+    """ConvNeXt-Tiny backbone, output: [B, feature_dim]"""
+    def __init__(self, pretrained=True):
         super().__init__()
-        m = models.convnext_tiny(weights='DEFAULT')
-        self.feat_dim = m.classifier[2].in_features
-        self.backbone = nn.Sequential(m.features, m.avgpool, m.classifier[0], m.classifier[1])
-    def forward(self, x): return self.backbone(x)
+        m = models.convnext_tiny(weights='DEFAULT' if pretrained else None)
+        self.feat_dim = m.classifier[2].in_features   # 768
+        # Keep LayerNorm + Flatten, remove final Linear
+        self.backbone = nn.Sequential(m.features, m.avgpool,
+                                       m.classifier[0], m.classifier[1])
+
+    def forward(self, x):
+        return self.backbone(x)   # [B, 768]
+
 
 class MultimodalTransformer(nn.Module):
-    def __init__(self, dim=768):
+    def __init__(self, cfg):
         super().__init__()
-        self.us_encoder = PatchEncoder()
-        self.path_encoder = PatchEncoder()
-        self.us_proj = nn.Linear(self.us_encoder.feat_dim, dim)
-        self.path_proj = nn.Linear(self.path_encoder.feat_dim, dim)
-        self.path_transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=dim, nhead=8, batch_first=True), num_layers=2)
-        self.fusion_transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=dim, nhead=8, batch_first=True), num_layers=1)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.classifier = nn.Linear(dim, 1)
+        dim     = cfg['dim']
+        heads   = cfg['heads']
+        depth   = cfg['depth']
+        dropout = cfg['dropout']
 
-    def forward(self, us, path, mask, return_attn=False):
+        self.us_enc   = PatchEncoder()
+        self.path_enc = PatchEncoder()
+
+        # Freeze most backbone layers (only fine-tune last 2 stages)
+        for enc in [self.us_enc, self.path_enc]:
+            for name, p in enc.backbone.named_parameters():
+                if not any(k in name for k in ['5', '6', '7']):   # stage 3 = indices 5-6-7
+                    p.requires_grad = False
+
+        self.us_proj   = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
+        self.path_proj = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=heads, dim_feedforward=dim*2,
+            dropout=dropout, batch_first=True, norm_first=True)
+        self.path_transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)
+
+        fuse_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=heads, dim_feedforward=dim*2,
+            dropout=dropout, batch_first=True, norm_first=True)
+        self.fusion = nn.TransformerEncoder(fuse_layer, num_layers=1)
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Dropout(dropout),
+            nn.Linear(dim, 128),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, us, path, mask, return_feats=False):
+        """
+        us:   [B, 3, H, W]
+        path: [B, N, 3, H, W]
+        mask: [B, N] True = real patch
+        """
         B, N, C, H, W = path.shape
-        us_f = self.us_proj(self.us_encoder(us)).unsqueeze(1)
-        path_f = self.path_proj(self.path_encoder(path.view(-1, C, H, W))).view(B, N, -1)
-        path_seq = self.path_transformer(path_f, src_key_padding_mask=~mask)
-        combined = torch.cat([self.cls_token.expand(B, -1, -1), us_f, path_seq], dim=1)
-        full_mask = torch.zeros((B, N+2), dtype=torch.bool, device=us.device)
-        full_mask[:, 2:] = ~mask
-        fused = self.fusion_transformer(combined, src_key_padding_mask=full_mask)
-        out = self.classifier(fused[:, 0])
-        return (out, fused) if return_attn else out
 
-# ==========================================
-# 4. Training & Evaluation Pipeline
-# ==========================================
-def run_experiment():
-    df = audit_and_split()
-    
-    # Transforms
-    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    train_trans = transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(), transforms.ToTensor(), norm])
-    val_trans = transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.ToTensor(), norm])
+        us_f   = self.us_proj(self.us_enc(us)).unsqueeze(1)          # [B,1,dim]
+        path_f = self.path_enc(path.view(B*N, C, H, W))              # [B*N, 768]
+        path_f = self.path_proj(path_f).view(B, N, -1)               # [B,N,dim]
 
-    fold_id = 0
-    train_df = df[df['fold'] != fold_id]
-    val_df = df[df['fold'] == fold_id]
-    
-    train_loader = DataLoader(MultimodalDataset(train_df, train_trans, train_trans), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(MultimodalDataset(val_df, val_trans, val_trans), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-    
-    model = MultimodalTransformer().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([0.86]).to(device))
-    
-    history = {'train_loss': [], 'val_auc': []}
-    
-    print("\n--- Stage 2: Training ---")
-    for epoch in range(EPOCHS):
+        path_f = self.path_transformer(path_f, src_key_padding_mask=~mask)
+
+        cls  = self.cls_token.expand(B, -1, -1)
+        seq  = torch.cat([cls, us_f, path_f], dim=1)                 # [B, N+2, dim]
+
+        fuse_mask = torch.zeros((B, N+2), dtype=torch.bool, device=us.device)
+        fuse_mask[:, 2:] = ~mask
+        fused = self.fusion(seq, src_key_padding_mask=fuse_mask)
+
+        logit = self.head(fused[:, 0])                               # [B,1]
+
+        if return_feats:
+            return logit, {'us_f': us_f, 'path_f': path_f, 'fused': fused}
+        return logit
+
+
+# ──────────────────────────────────────────────
+# 4. LOSS — Label-smoothed BCE
+# ──────────────────────────────────────────────
+class LabelSmoothBCE(nn.Module):
+    def __init__(self, smoothing=0.05, pos_weight=None):
+        super().__init__()
+        self.s = smoothing
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    def forward(self, logit, target):
+        target_s = target * (1 - self.s) + self.s * 0.5
+        return self.bce(logit, target_s.unsqueeze(1))
+
+
+# ──────────────────────────────────────────────
+# 5. TRAINING LOOP (one fold)
+# ──────────────────────────────────────────────
+def train_fold(df, cfg, fold_id):
+    print(f"\n=== Stage 2: Training — Fold {fold_id} ===")
+
+    train_df = df[df.fold != fold_id]
+    val_df   = df[df.fold == fold_id]
+
+    # Compute pos_weight from training set only
+    n0 = (train_df.label == 0).sum()
+    n1 = (train_df.label == 1).sum()
+    pos_w = torch.tensor([n0 / n1], dtype=torch.float32).to(device)
+    print(f"Train: {len(train_df)} pts, pos_weight={pos_w.item():.3f}")
+
+    us_tr, path_tr = get_transforms(cfg, augment=True)
+    us_vl, path_vl = get_transforms(cfg, augment=False)
+
+    tr_loader = DataLoader(
+        ThyroidDataset(train_df, us_tr, path_tr),
+        batch_size=cfg['batch_size'], shuffle=True, collate_fn=collate_fn,
+        num_workers=0, pin_memory=True,
+    )
+    vl_loader = DataLoader(
+        ThyroidDataset(val_df, us_vl, path_vl),
+        batch_size=cfg['batch_size'], shuffle=False, collate_fn=collate_fn,
+        num_workers=0, pin_memory=True,
+    )
+
+    model     = MultimodalTransformer(cfg).to(device)
+    criterion = LabelSmoothBCE(smoothing=cfg['label_smooth'], pos_weight=pos_w)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg['lr'], weight_decay=cfg['weight_decay']
+    )
+    # Warmup + cosine decay
+    warmup_epochs = 5
+    def lr_lambda(ep):
+        if ep < warmup_epochs:
+            return (ep + 1) / warmup_epochs
+        prog = (ep - warmup_epochs) / max(1, cfg['epochs'] - warmup_epochs)
+        return 0.5 * (1 + np.cos(np.pi * prog))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    history = {'train_loss': [], 'val_auc': [], 'val_loss': [], 'lr': []}
+    best_auc  = 0.0
+    patience_counter = 0
+    ckpt_path = os.path.join(cfg['checkpoint_dir'], f'model_fold{fold_id}_best.pth')
+
+    for epoch in range(cfg['epochs']):
+        # --- Train ---
         model.train()
-        t_loss = 0
-        for b in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+        t_loss = 0.0
+        for b in tqdm(tr_loader, desc=f"Epoch {epoch+1:02d}/{cfg['epochs']} [Train]", leave=False):
+            us    = b['us'].to(device)
+            path  = b['path'].to(device)
+            mask  = b['mask'].to(device)
+            lbls  = b['labels'].to(device)
             optimizer.zero_grad()
-            out = model(b['us'].to(device), b['path'].to(device), b['mask'].to(device))
-            loss = criterion(out, b['label'].float().to(device).unsqueeze(1))
-            loss.backward(); optimizer.step()
+            out  = model(us, path, mask)
+            loss = criterion(out, lbls)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             t_loss += loss.item()
-        
+
+        # --- Validate ---
         model.eval()
-        preds, targets = [], []
+        v_loss, probs, targets = 0.0, [], []
         with torch.no_grad():
-            for b in val_loader:
-                out = model(b['us'].to(device), b['path'].to(device), b['mask'].to(device))
-                preds.extend(torch.sigmoid(out).cpu().numpy())
-                targets.extend(b['label'].numpy())
-        
-        auc = roc_auc_score(targets, preds)
-        history['train_loss'].append(t_loss/len(train_loader))
+            for b in vl_loader:
+                us   = b['us'].to(device)
+                path = b['path'].to(device)
+                mask = b['mask'].to(device)
+                lbls = b['labels'].to(device)
+                out  = model(us, path, mask)
+                v_loss += criterion(out, lbls).item()
+                probs.extend(torch.sigmoid(out).cpu().numpy().flatten())
+                targets.extend(lbls.cpu().numpy())
+
+        probs   = np.array(probs)
+        targets = np.array(targets)
+        auc     = roc_auc_score(targets, probs)
+        avg_tr  = t_loss / len(tr_loader)
+        avg_vl  = v_loss / len(vl_loader)
+        lr_now  = optimizer.param_groups[0]['lr']
+
+        history['train_loss'].append(avg_tr)
+        history['val_loss'].append(avg_vl)
         history['val_auc'].append(auc)
-        print(f"Epoch {epoch+1}: Loss={t_loss/len(train_loader):.4f}, Val AUROC={auc:.4f}")
+        history['lr'].append(lr_now)
 
-    # Plot History
-    plt.figure(figsize=(12, 5), dpi=100)
-    plt.subplot(1, 2, 1); plt.plot(history['train_loss'], color='navy', lw=2); plt.title('Training Loss'); plt.xlabel('Epoch')
-    plt.subplot(1, 2, 2); plt.plot(history['val_auc'], color='darkorange', lw=2); plt.title('Validation AUROC'); plt.xlabel('Epoch')
-    plt.savefig('training_history.png'); plt.show()
+        scheduler.step()
 
-    # Final Evaluation
-    print("\n--- Stage 3: Final Evaluation ---")
-    probs = np.array(preds).flatten()
-    targets = np.array(targets).flatten()
-    preds_binary = (probs > 0.5).astype(int)
-    
-    fpr, tpr, _ = roc_curve(targets, probs)
-    prec, rec, _ = precision_recall_curve(targets, probs)
-    cm = confusion_matrix(targets, preds_binary)
-    
-    plt.figure(figsize=(18, 5), dpi=100)
-    plt.subplot(1, 3, 1); plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC={roc_auc_score(targets, probs):.3f}'); plt.plot([0, 1], [0, 1], '--', color='navy'); plt.title('ROC Curve'); plt.legend()
-    plt.subplot(1, 3, 2); plt.plot(rec, prec, color='green', lw=2, label=f'AP={average_precision_score(targets, probs):.3f}'); plt.title('PR Curve'); plt.legend()
-    plt.subplot(1, 3, 3); sns.heatmap(cm, annot=True, fmt='d', cmap='Blues'); plt.title('Confusion Matrix'); plt.xticks([0.5, 1.5], ['Benign', 'PTC']); plt.yticks([0.5, 1.5], ['Benign', 'PTC'])
-    plt.savefig('final_metrics.png'); plt.show()
-    
-    metrics = {
-        'AUROC': roc_auc_score(targets, probs),
-        'AUPRC': average_precision_score(targets, probs),
-        'Accuracy': accuracy_score(targets, preds_binary),
-        'F1-Score': f1_score(targets, preds_binary),
-        'MCC': matthews_corrcoef(targets, preds_binary)
-    }
-    print("\nMetrics Summary Table:")
-    print(pd.DataFrame([metrics]).T.rename(columns={0: 'Value'}))
+        print(f"Epoch {epoch+1:02d} | TrainLoss={avg_tr:.4f} ValLoss={avg_vl:.4f} AUROC={auc:.4f} LR={lr_now:.2e}")
 
-    # Stage 4: Explainability
-    print("\n--- Stage 4: Explainability (Attention Analysis) ---")
-    visualize_attention(model, MultimodalDataset(val_df, val_trans, val_trans))
+        if auc > best_auc:
+            best_auc = auc
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'cfg': cfg,
+                'val_auc': auc,
+            }, ckpt_path)
+            print(f"  ✓ Saved best model (AUROC={best_auc:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg['patience']:
+                print(f"Early stop at epoch {epoch+1}")
+                break
 
-def visualize_attention(model, dataset, patient_idx=0):
+    _plot_training(history, fold_id, cfg)
+    return model, ckpt_path, val_df
+
+
+def _plot_training(history, fold_id, cfg):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(history['train_loss'], label='Train', color='#4C9BE8', lw=2)
+    axes[0].plot(history['val_loss'],   label='Val',   color='#E86B4C', lw=2)
+    axes[0].set_title(f'Loss (Fold {fold_id})', fontsize=12)
+    axes[0].set_xlabel('Epoch'); axes[0].legend()
+
+    axes[1].plot(history['val_auc'], color='#2CA02C', lw=2)
+    axes[1].set_title(f'Val AUROC (Fold {fold_id})', fontsize=12)
+    axes[1].set_xlabel('Epoch'); axes[1].set_ylim(0, 1)
+    best_ep = int(np.argmax(history['val_auc']))
+    axes[1].axvline(best_ep, color='red', linestyle='--', alpha=0.6, label=f'Best @{best_ep+1}')
+    axes[1].legend()
+
+    axes[2].semilogy(history['lr'], color='#9467BD', lw=2)
+    axes[2].set_title(f'Learning Rate (Fold {fold_id})', fontsize=12)
+    axes[2].set_xlabel('Epoch')
+
+    plt.tight_layout()
+    path = os.path.join(cfg['graphs_dir'], f'training_fold{fold_id}.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+# ──────────────────────────────────────────────
+# 6. COMPREHENSIVE EVALUATION
+# ──────────────────────────────────────────────
+def evaluate(model, val_df, cfg, fold_id, ckpt_path=None):
+    print(f"\n=== Stage 3: Evaluation — Fold {fold_id} ===")
+
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['model_state'])
+        print(f"Loaded checkpoint (epoch {ckpt['epoch']+1}, AUROC={ckpt['val_auc']:.4f})")
+
+    us_tf, path_tf = get_transforms(cfg, augment=False)
+    loader = DataLoader(
+        ThyroidDataset(val_df, us_tf, path_tf),
+        batch_size=cfg['batch_size'], shuffle=False, collate_fn=collate_fn,
+    )
+
     model.eval()
-    item = dataset[patient_idx]
-    us = item['us'].unsqueeze(0).to(device)
-    path = item['path'].unsqueeze(0).to(device)
-    mask = torch.ones((1, path.shape[1]), dtype=torch.bool).to(device)
-    
+    probs, targets, pids = [], [], []
     with torch.no_grad():
-        out, fused = model(us, path, mask, return_attn=True)
-        # fused: [B, N+2, dim]
-        cls_token = fused[0, 0]
-        tokens = fused[0, 1:] # US + Path patches
-        sim = torch.nn.functional.cosine_similarity(cls_token.unsqueeze(0), tokens).cpu().numpy()
-        
-    us_sim = sim[0]
-    path_sims = sim[1:]
-    
-    plt.figure(figsize=(15, 6), dpi=100)
-    # Ultrasound
-    plt.subplot(1, len(path_sims) + 1, 1)
-    us_img = item['us'].permute(1, 2, 0).numpy()
-    us_img = us_img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-    plt.imshow(np.clip(us_img, 0, 1))
-    plt.title(f"US Score: {us_sim:.3f}"); plt.axis('off')
-    
-    # Path patches
-    for i in range(len(path_sims)):
-        plt.subplot(1, len(path_sims) + 1, i + 2)
-        p_img = item['path'][i].permute(1, 2, 0).numpy()
-        p_img = p_img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-        plt.imshow(np.clip(p_img, 0, 1))
-        plt.title(f"Path {i+1}: {path_sims[i]:.3f}"); plt.axis('off')
-        
-    plt.suptitle(f"Multimodal Attention Analysis: {item['id']}")
-    plt.savefig('explainability.png'); plt.show()
+        for b in tqdm(loader, desc="Evaluating"):
+            out = model(b['us'].to(device), b['path'].to(device), b['mask'].to(device))
+            probs.extend(torch.sigmoid(out).cpu().numpy().flatten())
+            targets.extend(b['labels'].numpy())
+            pids.extend(b['pids'])
 
-if __name__ == "__main__":
-    run_experiment()
+    probs   = np.array(probs)
+    targets = np.array(targets)
+    preds   = (probs > 0.5).astype(int)
+
+    # Youden threshold
+    fpr_arr, tpr_arr, thresholds = roc_curve(targets, probs)
+    youden_idx  = np.argmax(tpr_arr - fpr_arr)
+    best_thresh = thresholds[youden_idx]
+    preds_y     = (probs > best_thresh).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(targets, preds).ravel()
+    tn_y, fp_y, fn_y, tp_y = confusion_matrix(targets, preds_y).ravel()
+
+    metrics = {
+        'AUROC':        roc_auc_score(targets, probs),
+        'AUPRC':        average_precision_score(targets, probs),
+        'Accuracy':     accuracy_score(targets, preds),
+        'Balanced Acc': balanced_accuracy_score(targets, preds),
+        'F1':           f1_score(targets, preds),
+        'MCC':          matthews_corrcoef(targets, preds),
+        'Cohen Kappa':  cohen_kappa_score(targets, preds),
+        'Sensitivity':  tp / (tp + fn),
+        'Specificity':  tn / (tn + fp),
+        'PPV':          tp / (tp + fp) if (tp+fp) > 0 else 0,
+        'NPV':          tn / (tn + fn) if (tn+fn) > 0 else 0,
+        'Brier Score':  brier_score_loss(targets, probs),
+        # Youden threshold
+        'F1 (Youden)':  f1_score(targets, preds_y),
+        'Sens (Youden)':tp_y / (tp_y + fn_y),
+        'Spec (Youden)':tn_y / (tn_y + fp_y),
+        'Thresh (Youden)': best_thresh,
+    }
+
+    # Bootstrap 95% CI for AUROC
+    aucs_boot = []
+    rng = np.random.default_rng(cfg['seed'])
+    for _ in range(1000):
+        idx = rng.choice(len(targets), len(targets), replace=True)
+        if len(np.unique(targets[idx])) < 2: continue
+        aucs_boot.append(roc_auc_score(targets[idx], probs[idx]))
+    ci_lo, ci_hi = np.percentile(aucs_boot, [2.5, 97.5])
+    metrics['AUROC 95% CI'] = f"[{ci_lo:.3f}, {ci_hi:.3f}]"
+
+    print("\n--- Metrics ---")
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"  {k:20s}: {v:.4f}")
+        else:
+            print(f"  {k:20s}: {v}")
+
+    _plot_evaluation(targets, probs, preds, pids, metrics, fold_id, cfg)
+    return metrics, probs, targets, pids
+
+
+def _plot_evaluation(targets, probs, preds, pids, metrics, fold_id, cfg):
+    # ── Figure 1: ROC + PR + Calibration + Confusion matrix ──
+    fig = plt.figure(figsize=(20, 5))
+    gs  = gridspec.GridSpec(1, 4, figure=fig)
+
+    # ROC
+    ax = fig.add_subplot(gs[0])
+    fpr, tpr, _ = roc_curve(targets, probs)
+    ax.plot(fpr, tpr, color='darkorange', lw=2, label=f"AUC={metrics['AUROC']:.3f}")
+    ax.fill_between(fpr, tpr, alpha=0.08, color='darkorange')
+    ax.plot([0,1],[0,1],'--',color='navy',lw=1)
+    ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.set_title('ROC Curve'); ax.legend()
+
+    # PR
+    ax = fig.add_subplot(gs[1])
+    prec, rec, _ = precision_recall_curve(targets, probs)
+    ax.plot(rec, prec, color='green', lw=2, label=f"AP={metrics['AUPRC']:.3f}")
+    ax.fill_between(rec, prec, alpha=0.08, color='green')
+    ax.set_xlabel('Recall'); ax.set_ylabel('Precision'); ax.set_title('PR Curve'); ax.legend()
+
+    # Calibration
+    ax = fig.add_subplot(gs[2])
+    frac_pos, mean_pred = calibration_curve(targets, probs, n_bins=10)
+    ax.plot(mean_pred, frac_pos, 's-', color='#4C9BE8', lw=2, label=f"Brier={metrics['Brier Score']:.3f}")
+    ax.plot([0,1],[0,1],'--',color='grey',lw=1)
+    ax.set_xlabel('Mean predicted prob'); ax.set_ylabel('Fraction positives')
+    ax.set_title('Calibration Curve'); ax.legend()
+
+    # Confusion matrix
+    ax = fig.add_subplot(gs[3])
+    cm = confusion_matrix(targets, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=['Benign','PTC'], yticklabels=['Benign','PTC'])
+    ax.set_xlabel('Predicted'); ax.set_ylabel('True')
+    ax.set_title(f"Confusion Matrix\nAcc={metrics['Accuracy']:.3f}")
+
+    plt.suptitle(f'Evaluation — Fold {fold_id}', fontsize=13, y=1.01)
+    plt.tight_layout()
+    path = os.path.join(cfg['graphs_dir'], f'eval_main_fold{fold_id}.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+    # ── Figure 2: Score distributions + per-threshold metrics ──
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Score distribution by class
+    axes[0].hist(probs[targets==0], bins=20, alpha=0.6, color='#4C9BE8', label='Benign', density=True)
+    axes[0].hist(probs[targets==1], bins=20, alpha=0.6, color='#E86B4C', label='PTC',    density=True)
+    axes[0].axvline(0.5, color='k', linestyle='--', lw=1, label='Thresh=0.5')
+    axes[0].axvline(metrics['Thresh (Youden)'], color='red', linestyle='--', lw=1,
+                    label=f"Youden={metrics['Thresh (Youden)']:.2f}")
+    axes[0].set_xlabel('Predicted probability'); axes[0].set_title('Score Distribution')
+    axes[0].legend(fontsize=9)
+
+    # Sensitivity / Specificity vs Threshold
+    ths = np.linspace(0, 1, 101)
+    sens_list, spec_list, f1_list = [], [], []
+    for t in ths:
+        p = (probs > t).astype(int)
+        tn_t, fp_t, fn_t, tp_t = confusion_matrix(targets, p, labels=[0,1]).ravel()
+        sens_list.append(tp_t / (tp_t + fn_t + 1e-9))
+        spec_list.append(tn_t / (tn_t + fp_t + 1e-9))
+        f1_list.append(f1_score(targets, p, zero_division=0))
+    axes[1].plot(ths, sens_list, color='#E86B4C', lw=2, label='Sensitivity')
+    axes[1].plot(ths, spec_list, color='#4C9BE8', lw=2, label='Specificity')
+    axes[1].plot(ths, f1_list,   color='#2CA02C', lw=2, label='F1')
+    axes[1].axvline(metrics['Thresh (Youden)'], color='k', linestyle='--', lw=1, label='Youden')
+    axes[1].set_xlabel('Threshold'); axes[1].set_title('Metrics vs Threshold'); axes[1].legend()
+
+    # Metrics bar chart
+    bar_keys = ['AUROC','AUPRC','Accuracy','Balanced Acc','F1','Sensitivity','Specificity','MCC']
+    bar_vals = [metrics[k] for k in bar_keys]
+    colors = ['#4C9BE8' if v >= 0.8 else '#E86B4C' if v < 0.6 else '#EFA91A' for v in bar_vals]
+    axes[2].barh(bar_keys, bar_vals, color=colors, edgecolor='k', linewidth=0.4)
+    axes[2].set_xlim(0, 1.05)
+    for i, v in enumerate(bar_vals):
+        axes[2].text(v + 0.01, i, f'{v:.3f}', va='center', fontsize=9)
+    axes[2].set_title('Key Metrics Summary')
+    axes[2].axvline(0.8, color='grey', linestyle='--', lw=0.8, alpha=0.5)
+
+    plt.tight_layout()
+    path = os.path.join(cfg['graphs_dir'], f'eval_detail_fold{fold_id}.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+    # ── Figure 3: Patient-level predictions ranked ──
+    df_res = pd.DataFrame({'pid': pids, 'true': targets, 'prob': probs})
+    df_res = df_res.sort_values('prob', ascending=False)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    colors_pt = ['#E86B4C' if t == 1 else '#4C9BE8' for t in df_res['true']]
+    ax.bar(range(len(df_res)), df_res['prob'], color=colors_pt, edgecolor='none', width=1.0)
+    ax.axhline(0.5, color='k',   linestyle='--', lw=1, label='Threshold 0.5')
+    ax.axhline(metrics['Thresh (Youden)'], color='red', linestyle=':', lw=1, label='Youden')
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color='#E86B4C', label='PTC'),
+                        Patch(color='#4C9BE8', label='Benign')] +
+              ax.get_legend_handles_labels()[0], fontsize=9)
+    ax.set_xlabel('Patient (ranked by score)'); ax.set_ylabel('Predicted probability')
+    ax.set_title(f'Patient-Level Predictions (Fold {fold_id})')
+    plt.tight_layout()
+    path = os.path.join(cfg['graphs_dir'], f'patient_scores_fold{fold_id}.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+# ──────────────────────────────────────────────
+# 7. EXPLAINABILITY — Attention-based
+# ──────────────────────────────────────────────
+def visualize_attention(model, val_df, cfg, fold_id, n_cases=4):
+    print(f"\n=== Stage 4: Explainability ===")
+    us_tf, path_tf = get_transforms(cfg, augment=False)
+    ds = ThyroidDataset(val_df, us_tf, path_tf)
+    model.eval()
+
+    # Sample 2 true positives + 2 true negatives
+    sample_indices = []
+    probs_all, tgts_all = [], []
+    with torch.no_grad():
+        for i in range(len(ds)):
+            item  = ds[i]
+            us    = item['us'].unsqueeze(0).to(device)
+            path  = item['patches'].unsqueeze(0).to(device)
+            mask  = torch.ones(1, item['n_patches'], dtype=torch.bool).to(device)
+            out, feats = model(us, path, mask, return_feats=True)
+            p = torch.sigmoid(out).item()
+            probs_all.append(p)
+            tgts_all.append(item['label'].item())
+
+    probs_all = np.array(probs_all)
+    tgts_all  = np.array(tgts_all)
+    tp_idx = np.where((tgts_all == 1) & (probs_all > 0.5))[0]
+    tn_idx = np.where((tgts_all == 0) & (probs_all < 0.5))[0]
+    fp_idx = np.where((tgts_all == 0) & (probs_all > 0.5))[0]
+    fn_idx = np.where((tgts_all == 1) & (probs_all < 0.5))[0]
+
+    cases = []
+    for group, label in [(tp_idx,'TP'), (tn_idx,'TN'), (fp_idx,'FP'), (fn_idx,'FN')]:
+        if len(group) > 0:
+            cases.append((group[0], label))
+        if len(cases) >= n_cases:
+            break
+
+    denorm = transforms.Compose([
+        transforms.Normalize(mean=[0,0,0], std=[1/0.229, 1/0.224, 1/0.225]),
+        transforms.Normalize(mean=[-0.485,-0.456,-0.406], std=[1,1,1]),
+    ])
+
+    for case_idx, case_label in cases:
+        item  = ds[case_idx]
+        us    = item['us'].unsqueeze(0).to(device)
+        path  = item['patches'].unsqueeze(0).to(device)
+        n_p   = item['n_patches']
+        mask  = torch.zeros(1, n_p, dtype=torch.bool).to(device)
+        mask[0, :n_p] = True
+
+        with torch.no_grad():
+            out, feats = model(us, path, mask, return_feats=True)
+            prob  = torch.sigmoid(out).item()
+            cls_f = feats['fused'][0, 0]                      # [dim]
+            patch_fs = feats['fused'][0, 2:2+n_p]             # [n_p, dim]
+            sims = F.cosine_similarity(cls_f.unsqueeze(0), patch_fs).cpu().numpy()
+
+        n_cols = n_p + 1
+        fig, axes = plt.subplots(1, n_cols, figsize=(3*n_cols, 4))
+        if n_cols == 1: axes = [axes]
+
+        us_img = denorm(item['us']).permute(1,2,0).numpy()
+        us_img = np.clip(us_img, 0, 1)
+        axes[0].imshow(us_img)
+        axes[0].set_title(f"Ultrasound\nTrue={int(item['label'].item())} Pred={prob:.2f}", fontsize=9)
+        axes[0].axis('off')
+
+        for j in range(n_p):
+            p_img = denorm(item['patches'][j]).permute(1,2,0).numpy()
+            p_img = np.clip(p_img, 0, 1)
+            axes[j+1].imshow(p_img)
+            axes[j+1].set_title(f"Patch {j+1}\nSim={sims[j]:.3f}", fontsize=9)
+            axes[j+1].axis('off')
+
+        plt.suptitle(f"{case_label} | Patient: {item['pid']} | P(PTC)={prob:.3f}", fontsize=10)
+        plt.tight_layout()
+        path = os.path.join(cfg['graphs_dir'], f'attention_{case_label}_fold{fold_id}.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {path}")
+
+
+# ──────────────────────────────────────────────
+# 8. MAIN ENTRY POINT
+# ──────────────────────────────────────────────
+def run():
+    t0 = time.time()
+
+    df       = build_metadata(CFG)
+    model, ckpt_path, val_df = train_fold(df, CFG, CFG['fold_id'])
+    metrics, probs, targets, pids = evaluate(model, val_df, CFG, CFG['fold_id'], ckpt_path)
+    visualize_attention(model, val_df, CFG, CFG['fold_id'])
+
+    # Save metrics table
+    out_df = pd.DataFrame([{k: (f"{v:.4f}" if isinstance(v, float) else v)
+                             for k, v in metrics.items()}])
+    metrics_path = os.path.join(CFG['graphs_dir'], f"metrics_fold{CFG['fold_id']}.csv")
+    out_df.to_csv(metrics_path, index=False)
+    print(f"\nSaved metrics → {metrics_path}")
+    print(f"\nTotal runtime: {(time.time()-t0)/60:.1f} min")
+
+if __name__ == '__main__':
+    run()

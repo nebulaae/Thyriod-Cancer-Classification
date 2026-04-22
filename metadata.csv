@@ -1,4 +1,4 @@
-patient_id,original_id,label,ultrasound_image_path,pathology_patch_paths,num_patches,fold
+patient_id,original_id,label,us_path,patch_paths,num_patches,fold
 benign_1,1,0,dataset2\1.jpg,dataset1\1_001.tif;dataset1\1_002.tif;dataset1\1_003.tif,3,4
 benign_2,2,0,dataset2\2.jpg,dataset1\2_001.tif;dataset1\2_002.tif;dataset1\2_003.tif,3,3
 benign_3,3,0,dataset2\3.JPG,dataset1\3_001.tif;dataset1\3_002.tif;dataset1\3_003.tif,3,3

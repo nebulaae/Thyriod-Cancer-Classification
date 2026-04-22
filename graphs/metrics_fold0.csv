@@ -1,0 +1,2 @@
+AUROC,AUPRC,Accuracy,Balanced Acc,F1,MCC,Cohen Kappa,Sensitivity,Specificity,PPV,NPV,Brier Score,F1 (Youden),Sens (Youden),Spec (Youden),Thresh (Youden),AUROC 95% CI
+0.9787,0.9839,0.8831,0.8636,0.9072,0.7770,0.7529,1.0000,0.7273,0.8302,1.0000,0.0937,0.9348,0.9773,0.8485,0.8924,"[0.948, 0.997]"
