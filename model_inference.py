@@ -18,105 +18,44 @@ python model_inference.py \
     --csv metadata.csv \
     --ckpt checkpoints/model_fold0_best.pth \
     --output inference_results.csv
+
+# Interactive demo (uses metadata.csv; --ckpt defaults to checkpoints/model_fold0_best.pth)
+python model_inference.py
 """
 
 import os, argparse, glob
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torchvision import models, transforms
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from model import MultimodalTransformer, get_eval_transform, IMAGENET_MEAN, IMAGENET_STD
 
-# ── Re-define model (must match main.py exactly) ────────────────
-class PatchEncoder(nn.Module):
-    def __init__(self, pretrained=False):
-        super().__init__()
-        m = models.convnext_tiny(weights=None)
-        self.feat_dim = m.classifier[2].in_features
-        self.backbone = nn.Sequential(m.features, m.avgpool,
-                                       m.classifier[0], m.classifier[1])
-    def forward(self, x):
-        return self.backbone(x)
-
-
-class MultimodalTransformer(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        dim     = cfg['dim']
-        heads   = cfg['heads']
-        depth   = cfg['depth']
-        dropout = cfg['dropout']
-
-        self.us_enc   = PatchEncoder()
-        self.path_enc = PatchEncoder()
-
-        self.us_proj   = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
-        self.path_proj = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim*2,
-            dropout=dropout, batch_first=True, norm_first=True)
-        self.path_transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)
-
-        fuse_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim*2,
-            dropout=dropout, batch_first=True, norm_first=True)
-        self.fusion = nn.TransformerEncoder(fuse_layer, num_layers=1)
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Dropout(dropout),
-            nn.Linear(dim, 128),
-            nn.GELU(),
-            nn.Dropout(dropout / 2),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, us, path, mask, return_feats=False):
-        B, N, C, H, W = path.shape
-        us_f   = self.us_proj(self.us_enc(us)).unsqueeze(1)
-        path_f = self.path_enc(path.view(B*N, C, H, W))
-        path_f = self.path_proj(path_f).view(B, N, -1)
-        path_f = self.path_transformer(path_f, src_key_padding_mask=~mask)
-        cls    = self.cls_token.expand(B, -1, -1)
-        seq    = torch.cat([cls, us_f, path_f], dim=1)
-        fuse_mask = torch.zeros((B, N+2), dtype=torch.bool, device=us.device)
-        fuse_mask[:, 2:] = ~mask
-        fused  = self.fusion(seq, src_key_padding_mask=fuse_mask)
-        logit  = self.head(fused[:, 0])
-        if return_feats:
-            return logit, {'us_f': us_f, 'path_f': path_f, 'fused': fused}
-        return logit
+DEFAULT_CKPT = os.path.join('checkpoints', 'model_fold0_best.pth')
 
 
 # ── Preprocessing ────────────────────────────────────────────────
 def get_transform(img_size=224):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+    return get_eval_transform(img_size)
 
 def denorm(tensor):
     t = tensor.clone()
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
-    std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+    mean = torch.tensor(IMAGENET_MEAN).view(3,1,1)
+    std  = torch.tensor(IMAGENET_STD).view(3,1,1)
     return torch.clamp(t * std + mean, 0, 1)
 
 
 # ── Load model from checkpoint ───────────────────────────────────
 def load_model(ckpt_path, device):
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path} (train with main.py or pass --ckpt)")
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg  = ckpt.get('cfg', {
         'dim': 512, 'heads': 8, 'depth': 1, 'dropout': 0.4
     })
-    model = MultimodalTransformer(cfg).to(device)
+    model = MultimodalTransformer(cfg, pretrained=False).to(device)   # weights come from ckpt
     model.load_state_dict(ckpt['model_state'])
     model.eval()
     print(f"Loaded: {ckpt_path}")
@@ -233,7 +172,8 @@ def predict_batch(model, csv_path, device, img_size=224, output_csv='inference_r
 # ── CLI ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description='Thyroid Multimodal Inference')
-    parser.add_argument('--ckpt', required=True, help='Checkpoint path (.pth)')
+    parser.add_argument('--ckpt', default=DEFAULT_CKPT,
+                        help=f'Checkpoint path (.pth), default: {DEFAULT_CKPT}')
     parser.add_argument('--us_path',    default=None, help='Single: ultrasound image')
     parser.add_argument('--patch_dir',  default=None, help='Single: dir with patient patches')
     parser.add_argument('--patient_id', default=None, help='Single: patient ID (for patch glob)')
