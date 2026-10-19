@@ -21,7 +21,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
+from torchvision import transforms
+
+from model import (MultimodalTransformer, count_parameters, get_eval_transform,
+                   IMAGENET_MEAN, IMAGENET_STD)
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
@@ -39,7 +42,9 @@ CFG = dict(
     seed        = 42,
     n_folds     = 5,
     fold_id     = 0,          # which fold to run as main experiment
+    run_all_folds = False,    # True → train/evaluate every fold + mean ± SD summary
     epochs      = 10,
+    warmup_epochs = 5,        # linear warmup, then cosine decay
     lr          = 3e-5,       # lower LR → less overfitting
     weight_decay= 1e-3,
     batch_size  = 2,
@@ -49,7 +54,8 @@ CFG = dict(
     heads       = 8,
     dropout     = 0.4,        # heavy dropout
     label_smooth= 0.05,       # label smoothing
-    patience    = 12,         # early stopping patience
+    patience    = 5,          # early stopping patience (must be < epochs to take effect)
+    trainable_from_feature = 5,  # convnext features[5:] trainable (stage 3, down, stage 4)
     max_patches = 7,
     checkpoint_dir = 'checkpoints',
     graphs_dir     = 'graphs',
@@ -230,7 +236,7 @@ def collate_fn(batch):
 
 
 def get_transforms(cfg, augment=False):
-    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    norm = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
     sz   = cfg['img_size']
     if augment:
         us_tf = transforms.Compose([
@@ -249,97 +255,14 @@ def get_transforms(cfg, augment=False):
             transforms.ToTensor(), norm,
         ])
     else:
-        us_tf = path_tf = transforms.Compose([
-            transforms.Resize((sz, sz)),
-            transforms.ToTensor(), norm,
-        ])
+        us_tf = path_tf = get_eval_transform(sz)
     return us_tf, path_tf
 
 
 # ──────────────────────────────────────────────
 # 3. MODEL
 # ──────────────────────────────────────────────
-class PatchEncoder(nn.Module):
-    """ConvNeXt-Tiny backbone, output: [B, feature_dim]"""
-    def __init__(self, pretrained=True):
-        super().__init__()
-        m = models.convnext_tiny(weights='DEFAULT' if pretrained else None)
-        self.feat_dim = m.classifier[2].in_features   # 768
-        # Keep LayerNorm + Flatten, remove final Linear
-        self.backbone = nn.Sequential(m.features, m.avgpool,
-                                       m.classifier[0], m.classifier[1])
-
-    def forward(self, x):
-        return self.backbone(x)   # [B, 768]
-
-
-class MultimodalTransformer(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        dim     = cfg['dim']
-        heads   = cfg['heads']
-        depth   = cfg['depth']
-        dropout = cfg['dropout']
-
-        self.us_enc   = PatchEncoder()
-        self.path_enc = PatchEncoder()
-
-        # Freeze most backbone layers (only fine-tune last 2 stages)
-        for enc in [self.us_enc, self.path_enc]:
-            for name, p in enc.backbone.named_parameters():
-                if not any(k in name for k in ['5', '6', '7']):   # stage 3 = indices 5-6-7
-                    p.requires_grad = False
-
-        self.us_proj   = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
-        self.path_proj = nn.Sequential(nn.Linear(768, dim), nn.LayerNorm(dim), nn.Dropout(dropout))
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim*2,
-            dropout=dropout, batch_first=True, norm_first=True)
-        self.path_transformer = nn.TransformerEncoder(enc_layer, num_layers=depth)
-
-        fuse_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim*2,
-            dropout=dropout, batch_first=True, norm_first=True)
-        self.fusion = nn.TransformerEncoder(fuse_layer, num_layers=1)
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Dropout(dropout),
-            nn.Linear(dim, 128),
-            nn.GELU(),
-            nn.Dropout(dropout / 2),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, us, path, mask, return_feats=False):
-        """
-        us:   [B, 3, H, W]
-        path: [B, N, 3, H, W]
-        mask: [B, N] True = real patch
-        """
-        B, N, C, H, W = path.shape
-
-        us_f   = self.us_proj(self.us_enc(us)).unsqueeze(1)          # [B,1,dim]
-        path_f = self.path_enc(path.view(B*N, C, H, W))              # [B*N, 768]
-        path_f = self.path_proj(path_f).view(B, N, -1)               # [B,N,dim]
-
-        path_f = self.path_transformer(path_f, src_key_padding_mask=~mask)
-
-        cls  = self.cls_token.expand(B, -1, -1)
-        seq  = torch.cat([cls, us_f, path_f], dim=1)                 # [B, N+2, dim]
-
-        fuse_mask = torch.zeros((B, N+2), dtype=torch.bool, device=us.device)
-        fuse_mask[:, 2:] = ~mask
-        fused = self.fusion(seq, src_key_padding_mask=fuse_mask)
-
-        logit = self.head(fused[:, 0])                               # [B,1]
-
-        if return_feats:
-            return logit, {'us_f': us_f, 'path_f': path_f, 'fused': fused}
-        return logit
+# PatchEncoder / MultimodalTransformer live in model.py (shared with inference)
 
 
 # ──────────────────────────────────────────────
@@ -361,6 +284,9 @@ class LabelSmoothBCE(nn.Module):
 # ──────────────────────────────────────────────
 def train_fold(df, cfg, fold_id):
     print(f"\n=== Stage 2: Training — Fold {fold_id} ===")
+    # Re-seed so each fold is reproducible on its own (same state as a single-fold run)
+    torch.manual_seed(cfg['seed'])
+    np.random.seed(cfg['seed'])
 
     train_df = df[df.fold != fold_id]
     val_df   = df[df.fold == fold_id]
@@ -386,13 +312,18 @@ def train_fold(df, cfg, fold_id):
     )
 
     model     = MultimodalTransformer(cfg).to(device)
+    n_train, n_total = count_parameters(model)
+    print(f"Params: trainable={n_train:,} / total={n_total:,} ({100*n_train/n_total:.1f}%) "
+          f"| backbone features[{cfg['trainable_from_feature']}:] unfrozen")
     criterion = LabelSmoothBCE(smoothing=cfg['label_smooth'], pos_weight=pos_w)
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg['lr'], weight_decay=cfg['weight_decay']
     )
     # Warmup + cosine decay
-    warmup_epochs = 5
+    warmup_epochs = cfg['warmup_epochs']
+    if cfg['patience'] >= cfg['epochs']:
+        print(f"WARNING — patience ({cfg['patience']}) >= epochs ({cfg['epochs']}): early stopping can never trigger")
     def lr_lambda(ep):
         if ep < warmup_epochs:
             return (ep + 1) / warmup_epochs
@@ -772,20 +703,54 @@ def visualize_attention(model, val_df, cfg, fold_id, n_cases=4):
 # ──────────────────────────────────────────────
 # 8. MAIN ENTRY POINT
 # ──────────────────────────────────────────────
+def summarize_folds(fold_metrics, cfg):
+    """Write per-fold metrics and a mean ± SD summary across folds."""
+    all_df = pd.DataFrame(fold_metrics)
+    all_path = os.path.join(cfg['graphs_dir'], 'metrics_all_folds.csv')
+    all_df.to_csv(all_path, index=False)
+
+    num = all_df.drop(columns=['fold']).select_dtypes(include='number')
+    summary = pd.DataFrame({
+        'Metric': num.columns,
+        'Mean':   num.mean().values,
+        'SD':     num.std(ddof=1).values,
+    })
+    summary['Mean ± SD'] = [f"{m:.4f} ± {s:.4f}" for m, s in zip(summary['Mean'], summary['SD'])]
+    summary_path = os.path.join(cfg['graphs_dir'], 'metrics_cv_summary.csv')
+    summary.to_csv(summary_path, index=False)
+
+    print(f"\n=== Cross-validation summary ({len(all_df)} folds) ===")
+    for _, r in summary.iterrows():
+        print(f"  {r['Metric']:20s}: {r['Mean ± SD']}")
+    print(f"Saved {all_path}\nSaved {summary_path}")
+
+
 def run():
     t0 = time.time()
 
-    df       = build_metadata(CFG)
-    model, ckpt_path, val_df = train_fold(df, CFG, CFG['fold_id'])
-    metrics, probs, targets, pids = evaluate(model, val_df, CFG, CFG['fold_id'], ckpt_path)
-    visualize_attention(model, val_df, CFG, CFG['fold_id'])
+    df    = build_metadata(CFG)
+    folds = range(CFG['n_folds']) if CFG['run_all_folds'] else [CFG['fold_id']]
 
-    # Save metrics table
-    out_df = pd.DataFrame([{k: (f"{v:.4f}" if isinstance(v, float) else v)
-                             for k, v in metrics.items()}])
-    metrics_path = os.path.join(CFG['graphs_dir'], f"metrics_fold{CFG['fold_id']}.csv")
-    out_df.to_csv(metrics_path, index=False)
-    print(f"\nSaved metrics → {metrics_path}")
+    fold_metrics = []
+    for fold_id in folds:
+        model, ckpt_path, val_df = train_fold(df, CFG, fold_id)
+        metrics, probs, targets, pids = evaluate(model, val_df, CFG, fold_id, ckpt_path)
+        visualize_attention(model, val_df, CFG, fold_id)
+
+        # Save metrics table
+        out_df = pd.DataFrame([{k: (f"{v:.4f}" if isinstance(v, float) else v)
+                                 for k, v in metrics.items()}])
+        metrics_path = os.path.join(CFG['graphs_dir'], f"metrics_fold{fold_id}.csv")
+        out_df.to_csv(metrics_path, index=False)
+        print(f"\nSaved metrics → {metrics_path}")
+        fold_metrics.append({'fold': fold_id, **metrics})
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if len(fold_metrics) > 1:
+        summarize_folds(fold_metrics, CFG)
     print(f"\nTotal runtime: {(time.time()-t0)/60:.1f} min")
 
 if __name__ == '__main__':
