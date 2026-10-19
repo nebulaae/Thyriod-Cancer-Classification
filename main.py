@@ -24,9 +24,9 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from model import (MultimodalTransformer, count_parameters, get_eval_transform,
-                   IMAGENET_MEAN, IMAGENET_STD)
+                   sample_modality_dropout, IMAGENET_MEAN, IMAGENET_STD)
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, accuracy_score,
     f1_score, matthews_corrcoef, confusion_matrix,
@@ -56,6 +56,11 @@ CFG = dict(
     label_smooth= 0.05,       # label smoothing
     patience    = 5,          # early stopping patience (must be < epochs to take effect)
     trainable_from_feature = 5,  # convnext features[5:] trainable (stage 3, down, stage 4)
+    # Modality experiments (defaults reproduce the original joint pipeline)
+    mode        = 'joint',    # 'joint' | 'us_only' | 'cyto_only'
+    modality_dropout = None,  # e.g. dict(p_drop_cyto=0.3, p_drop_us=0.15); joint mode, training only
+    inner_val_frac   = None,  # e.g. 0.15 → stratified inner val split of the training folds for
+                              # checkpoint selection + Youden threshold; None → use the held-out fold
     max_patches = 7,
     checkpoint_dir = 'checkpoints',
     graphs_dir     = 'graphs',
@@ -282,14 +287,34 @@ class LabelSmoothBCE(nn.Module):
 # ──────────────────────────────────────────────
 # 5. TRAINING LOOP (one fold)
 # ──────────────────────────────────────────────
-def train_fold(df, cfg, fold_id):
-    print(f"\n=== Stage 2: Training — Fold {fold_id} ===")
+def split_fold(df, cfg, fold_id):
+    """Return (train_df, sel_df, test_df) for one outer fold.
+    sel_df drives checkpoint selection / threshold choice: an inner stratified
+    split of the training folds if cfg['inner_val_frac'] is set, else the test fold."""
+    train_df = df[df.fold != fold_id]
+    test_df  = df[df.fold == fold_id]
+    frac = cfg.get('inner_val_frac')
+    if frac:
+        train_df, sel_df = train_test_split(train_df, test_size=frac, stratify=train_df['label'],
+                                            random_state=cfg['seed'] + fold_id)
+    else:
+        sel_df = test_df
+    return train_df, sel_df, test_df
+
+
+def train_fold(df, cfg, fold_id, ckpt_name=None):
+    """Train one fold; returns (model, ckpt_path, selection_df). The selection set
+    is the held-out fold unless cfg['inner_val_frac'] creates an inner split."""
+    mode = cfg.get('mode', 'joint')
+    print(f"\n=== Stage 2: Training — Fold {fold_id} | mode={mode} ===")
     # Re-seed so each fold is reproducible on its own (same state as a single-fold run)
     torch.manual_seed(cfg['seed'])
     np.random.seed(cfg['seed'])
 
-    train_df = df[df.fold != fold_id]
-    val_df   = df[df.fold == fold_id]
+    train_df, val_df, _ = split_fold(df, cfg, fold_id)   # val_df = selection set
+    md = cfg.get('modality_dropout') if mode == 'joint' else None
+    if md:
+        print(f"Modality dropout: p_drop_cyto={md['p_drop_cyto']} p_drop_us={md['p_drop_us']}")
 
     # Compute pos_weight from training set only
     n0 = (train_df.label == 0).sum()
@@ -334,7 +359,8 @@ def train_fold(df, cfg, fold_id):
     history = {'train_loss': [], 'val_auc': [], 'val_loss': [], 'lr': []}
     best_auc  = 0.0
     patience_counter = 0
-    ckpt_path = os.path.join(cfg['checkpoint_dir'], f'model_fold{fold_id}_best.pth')
+    ckpt_name = ckpt_name or f'model_fold{fold_id}_best.pth'
+    ckpt_path = os.path.join(cfg['checkpoint_dir'], ckpt_name)
 
     for epoch in range(cfg['epochs']):
         # --- Train ---
@@ -346,7 +372,12 @@ def train_fold(df, cfg, fold_id):
             mask  = b['mask'].to(device)
             lbls  = b['labels'].to(device)
             optimizer.zero_grad()
-            out  = model(us, path, mask)
+            if md:
+                us_present, cyto_present = sample_modality_dropout(
+                    us.shape[0], md['p_drop_cyto'], md['p_drop_us'], device=device)
+                out = model(us, path, mask, us_present=us_present, cyto_present=cyto_present)
+            else:
+                out = model(us, path, mask)
             loss = criterion(out, lbls)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -399,11 +430,11 @@ def train_fold(df, cfg, fold_id):
                 print(f"Early stop at epoch {epoch+1}")
                 break
 
-    _plot_training(history, fold_id, cfg)
+    _plot_training(history, fold_id, cfg, tag=os.path.splitext(ckpt_name)[0].replace('_best', ''))
     return model, ckpt_path, val_df
 
 
-def _plot_training(history, fold_id, cfg):
+def _plot_training(history, fold_id, cfg, tag=None):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     axes[0].plot(history['train_loss'], label='Train', color='#4C9BE8', lw=2)
@@ -423,7 +454,8 @@ def _plot_training(history, fold_id, cfg):
     axes[2].set_xlabel('Epoch')
 
     plt.tight_layout()
-    path = os.path.join(cfg['graphs_dir'], f'training_fold{fold_id}.png')
+    name = f'training_fold{fold_id}' if tag in (None, f'model_fold{fold_id}') else f'training_{tag}'
+    path = os.path.join(cfg['graphs_dir'], f'{name}.png')
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved {path}")
@@ -489,13 +521,7 @@ def evaluate(model, val_df, cfg, fold_id, ckpt_path=None):
     }
 
     # Bootstrap 95% CI for AUROC
-    aucs_boot = []
-    rng = np.random.default_rng(cfg['seed'])
-    for _ in range(1000):
-        idx = rng.choice(len(targets), len(targets), replace=True)
-        if len(np.unique(targets[idx])) < 2: continue
-        aucs_boot.append(roc_auc_score(targets[idx], probs[idx]))
-    ci_lo, ci_hi = np.percentile(aucs_boot, [2.5, 97.5])
+    ci_lo, ci_hi = bootstrap_auc_ci(targets, probs, seed=cfg['seed'])
     metrics['AUROC 95% CI'] = f"[{ci_lo:.3f}, {ci_hi:.3f}]"
 
     print("\n--- Metrics ---")
@@ -507,6 +533,105 @@ def evaluate(model, val_df, cfg, fold_id, ckpt_path=None):
 
     _plot_evaluation(targets, probs, preds, pids, metrics, fold_id, cfg)
     return metrics, probs, targets, pids
+
+
+def bootstrap_auc_ci(targets, probs, seed=42, n_boot=1000):
+    """Percentile bootstrap 95% CI for AUROC (patient-level resampling)."""
+    aucs_boot = []
+    rng = np.random.default_rng(seed)
+    for _ in range(n_boot):
+        idx = rng.choice(len(targets), len(targets), replace=True)
+        if len(np.unique(targets[idx])) < 2: continue
+        aucs_boot.append(roc_auc_score(targets[idx], probs[idx]))
+    return np.percentile(aucs_boot, [2.5, 97.5])
+
+
+# ──────────────────────────────────────────────
+# 6b. MISSING-MODALITY SCENARIOS
+# ──────────────────────────────────────────────
+SCENARIOS = ('both', 'us_missing', 'cyto_missing', 'few_patches')
+# Scenarios that are meaningful for each model mode (a single-modality model
+# cannot lose its only modality; us_only ignores cytology entirely)
+SCENARIOS_BY_MODE = {
+    'joint':     SCENARIOS,
+    'us_only':   ('both',),
+    'cyto_only': ('both', 'few_patches'),
+}
+FEW_PATCHES = 2   # 'few_patches' keeps only the first 2 cytology patches
+
+
+def predict(model, df, cfg, scenario='both'):
+    """Per-patient P(PTC) for one test-time scenario. Returns (probs, targets, pids)."""
+    us_tf, path_tf = get_transforms(cfg, augment=False)
+    loader = DataLoader(
+        ThyroidDataset(df, us_tf, path_tf),
+        batch_size=cfg['batch_size'], shuffle=False, collate_fn=collate_fn,
+    )
+    model.eval()
+    probs, targets, pids = [], [], []
+    with torch.no_grad():
+        for b in loader:
+            us, path, mask = b['us'].to(device), b['path'].to(device), b['mask'].to(device)
+            B = us.shape[0]
+            us_present = cyto_present = None
+            if scenario == 'us_missing':
+                us_present = torch.zeros(B, dtype=torch.bool, device=device)
+            elif scenario == 'cyto_missing':
+                cyto_present = torch.zeros(B, dtype=torch.bool, device=device)
+            elif scenario == 'few_patches':
+                path = path[:, :FEW_PATCHES].contiguous()
+                mask = mask[:, :FEW_PATCHES]
+            elif scenario != 'both':
+                raise ValueError(f"Unknown scenario {scenario!r}")
+            out = model(us, path, mask, us_present=us_present, cyto_present=cyto_present)
+            probs.extend(torch.sigmoid(out).cpu().numpy().flatten())
+            targets.extend(b['labels'].numpy())
+            pids.extend(b['pids'])
+    return np.array(probs), np.array(targets), pids
+
+
+def evaluate_scenarios(model, test_df, sel_df, cfg, scenarios=None):
+    """Predict every applicable scenario on the test fold and on the selection set
+    (used to pick the Youden threshold). Returns {scenario: predictions dict}."""
+    scenarios = scenarios or SCENARIOS_BY_MODE[cfg.get('mode', 'joint')]
+    nested = bool(cfg.get('inner_val_frac'))
+    out = {}
+    for sc in scenarios:
+        p_test, y_test, pids = predict(model, test_df, cfg, sc)
+        if nested:
+            p_sel, y_sel, _ = predict(model, sel_df, cfg, sc)
+        else:
+            p_sel, y_sel = p_test, y_test
+        out[sc] = dict(p_test=p_test, y_test=y_test, pids=pids,
+                       p_sel=p_sel, y_sel=y_sel, nested=nested)
+    return out
+
+
+def youden_threshold(targets, probs):
+    fpr, tpr, thresholds = roc_curve(targets, probs)
+    return thresholds[np.argmax(tpr - fpr)]
+
+
+def scenario_metrics(pred, seed=42):
+    """AUROC (+bootstrap 95% CI), AUPRC, Brier, and Sens/Spec at the Youden
+    threshold chosen on the selection set (inner val if nested, else the test fold)."""
+    y, p = pred['y_test'], pred['p_test']
+    thresh = youden_threshold(pred['y_sel'], pred['p_sel'])
+    preds = (p >= thresh).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, preds, labels=[0, 1]).ravel()
+    ci_lo, ci_hi = bootstrap_auc_ci(y, p, seed=seed)
+    return {
+        'n':            len(y),
+        'AUROC':        roc_auc_score(y, p),
+        'AUROC_CI_lo':  ci_lo,
+        'AUROC_CI_hi':  ci_hi,
+        'AUPRC':        average_precision_score(y, p),
+        'Sensitivity':  tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+        'Specificity':  tn / (tn + fp) if (tn + fp) > 0 else np.nan,
+        'Threshold':    thresh,
+        'Brier':        brier_score_loss(y, p),
+        'thresh_source': 'inner_val' if pred['nested'] else 'test_fold',
+    }
 
 
 def _plot_evaluation(targets, probs, preds, pids, metrics, fold_id, cfg):
@@ -733,9 +858,11 @@ def run():
 
     fold_metrics = []
     for fold_id in folds:
-        model, ckpt_path, val_df = train_fold(df, CFG, fold_id)
+        model, ckpt_path, _ = train_fold(df, CFG, fold_id)
+        _, _, val_df = split_fold(df, CFG, fold_id)   # held-out test fold
         metrics, probs, targets, pids = evaluate(model, val_df, CFG, fold_id, ckpt_path)
-        visualize_attention(model, val_df, CFG, fold_id)
+        if CFG['mode'] != 'us_only':   # patch-similarity maps need cytology tokens
+            visualize_attention(model, val_df, CFG, fold_id)
 
         # Save metrics table
         out_df = pd.DataFrame([{k: (f"{v:.4f}" if isinstance(v, float) else v)
