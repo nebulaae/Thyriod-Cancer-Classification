@@ -10,7 +10,7 @@ This project implements an end-to-end pipeline:
 
 build_metadata() → train_fold() → evaluate() → visualize_attention()
 
-All logic is centralized in **`main.py`** — no duplication or inconsistencies between transforms, dataloaders, or model definitions.
+The pipeline lives in **`main.py`**; the model architecture and evaluation transform live in **`model.py`**, which both `main.py` and `model_inference.py` import — no duplication or inconsistencies between transforms, dataloaders, or model definitions.
 
 ---
 
@@ -37,7 +37,9 @@ The dataset consists of four modalities:
 ## 🏗️ Project Structure
 
 ├── main.py - Training + evaluation pipeline <br>
+├── model.py - Shared model definition (encoders + transformer fusion) <br>
 ├── model_inference.py - Inference script <br>
+├── tests/ - CPU smoke tests (`python -m pytest tests/`) <br>
 ├── metadata.csv - Auto-generated dataset index <br>
 ├── checkpoints/ - Model weights <br>
 ├── graphs/ - Metrics & visualizations <br>
@@ -65,8 +67,9 @@ All components are defined **once and reused**:
 
 **Backbone Freezing**
 
-- Only last stage (stage 3) is trainable
-- Remaining layers are frozen
+- ConvNeXt `features[5:]` (stage 3, last downsample, stage 4) and the final LayerNorm are trainable
+- Stem, stages 1–2 and their downsamples are frozen
+- Controlled by `CFG['trainable_from_feature']`; trainable/total parameter counts are printed at model creation
 
 **Regularization**
 
@@ -87,7 +90,8 @@ All components are defined **once and reused**:
 
 **Training Strategy**
 
-- Early stopping based on **validation AUROC**
+- Early stopping based on **validation AUROC** (`patience=5` < `epochs=10`)
+- `CFG['run_all_folds'] = True` trains every fold and writes `graphs/metrics_cv_summary.csv` (mean ± SD)
 
 ---
 
@@ -172,6 +176,8 @@ python model_inference.py --csv metadata.csv
 ```bash
 python model_inference.py
 ```
+
+`--ckpt` defaults to `checkpoints/model_fold0_best.pth` in all modes.
 
 ## 💾 Outputs
 
