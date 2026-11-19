@@ -12,5 +12,6 @@ pillow
 # MVP web demo and deployment
 gradio==5.9.1
 huggingface_hub
+requests
 # Tests
 pytest

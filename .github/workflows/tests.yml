@@ -17,7 +17,7 @@ jobs:
       - name: Install CPU dependencies
         run: |
           pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install "numpy<2.2" pandas scikit-learn matplotlib seaborn tqdm pillow pytest gradio==5.9.1 huggingface_hub
+          pip install "numpy<2.2" pandas scikit-learn matplotlib seaborn tqdm pillow pytest gradio==5.9.1 huggingface_hub requests
       - name: Run system and unit tests
         run: python -m pytest tests/ -v --junitxml=test-results.xml
       - name: Upload test report

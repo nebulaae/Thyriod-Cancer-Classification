@@ -142,6 +142,8 @@ def build_ui():
             cases = []
             for case in sorted(os.listdir(ex_dir)):
                 d = os.path.join(ex_dir, case)
+                if not os.path.isdir(d):
+                    continue
                 us = [f for f in os.listdir(d) if f.startswith('us')]
                 pats = sorted(os.path.join(d, f) for f in os.listdir(d) if f.startswith('patch'))
                 if us and pats:

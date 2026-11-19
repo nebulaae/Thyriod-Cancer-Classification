@@ -398,10 +398,11 @@ def train_fold(df, cfg, fold_id, ckpt_name=None):
         generator=torch.Generator().manual_seed(cfg['seed']),
         worker_init_fn=_seed_worker,
     )
+    # Validation runs in the main process: extra worker processes cost ~600 MB RAM each on Windows
     vl_loader = DataLoader(
         ThyroidDataset(val_df, us_vl, path_vl),
         batch_size=cfg['batch_size'], shuffle=False, collate_fn=collate_fn,
-        num_workers=nw, pin_memory=True, persistent_workers=nw > 0,
+        num_workers=0, pin_memory=True,
     )
 
     model     = MultimodalTransformer(cfg).to(device)
