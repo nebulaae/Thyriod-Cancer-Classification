@@ -40,8 +40,13 @@ The dataset consists of four modalities:
 ├── model.py - Shared model definition (encoders + transformer fusion) <br>
 ├── model_inference.py - Inference script <br>
 ├── experiments.py - CV modality experiments (E1–E5) <br>
+├── ablation.py - Overfitting-control ablation A0–A3 + re-run check <br>
+├── dedup.py - Near-duplicate image audit (dHash) for leakage-safe folds <br>
+├── reliability.py - ECE + temperature scaling <br>
+├── app.py - Gradio MVP web demo <br>
+├── deploy/publish.py - Hugging Face model + Space publishing <br>
 ├── results/ - Experiment tables + out-of-fold predictions <br>
-├── tests/ - CPU smoke tests (`python -m pytest tests/`) <br>
+├── tests/ - Unit + system tests (`python -m pytest tests/`, run by GitHub Actions) <br>
 ├── metadata.csv - Auto-generated dataset index <br>
 ├── checkpoints/ - Model weights <br>
 ├── graphs/ - Metrics & visualizations <br>
@@ -227,6 +232,50 @@ python model_inference.py
 python main.py
 python model_inference.py
 ```
+
+---
+
+## 🧪 System Testing & Evaluation (Week 11)
+
+```bash
+# Environment (GPU)
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+
+# Tests: unit + full-pipeline system test on synthetic data (CPU, no downloads)
+python -m pytest tests/ -v
+
+# 5-fold CV with inner-validation selection, calibration and deletion test,
+# then the deployment model trained on all patients
+python main.py --data_root <folder with dataset1..4> --all_folds --final
+
+# Overfitting ablation A0–A3 (SO1) and same-seed re-run check (SO2)
+python ablation.py --data_root <folder> --folds 0 1 2 3 4
+python ablation.py --data_root <folder> --configs A3_full --repro --folds 0
+```
+
+What the pipeline now guarantees:
+
+- **Leakage-safe splits:** near-duplicate images (256-bit dHash, Hamming ≤ 8) group patients into one fold
+  (`StratifiedGroupKFold`); groups that mix benign and PTC labels are dropped and logged to
+  `graphs/duplicate_pairs.csv`.
+- **Unbiased selection:** checkpoint, Youden threshold and temperature are chosen on an inner, group-aware
+  validation split (15%) — never on the test fold.
+- **Calibration:** temperature scaling with ECE and Brier before/after (`reliability.py`).
+- **Faithfulness:** deletion test — removing the top-relevance patch vs a random patch on true positives.
+- **Speed/repro:** mixed precision on CUDA, fixed seeds, deterministic cuDNN.
+
+## 🌐 MVP Web Demo & Deployment
+
+```bash
+python app.py                      # local: http://127.0.0.1:7860 (uses checkpoints/medai_final.pth)
+hf auth login                      # once, with a write token
+python deploy/publish.py --user <hf-username>
+```
+
+`deploy/publish.py` uploads `medai_final.pth` to the model repo `<user>/medai-thyroid` and deploys the Gradio
+Space `<user>/medai-thyroid-demo` (CPU). The app shows the calibrated P(PTC), the decision at the deployed
+threshold and the cytology patches ranked by relevance. **Research use only.**
 
 ### Key Features
 
