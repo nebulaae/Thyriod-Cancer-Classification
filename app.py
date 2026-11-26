@@ -23,6 +23,13 @@ import gradio as gr
 
 from model import MultimodalTransformer, get_eval_transform
 
+try:                       # Hugging Face ZeroGPU: GPU is attached only inside @spaces.GPU calls
+    import spaces
+    gpu_task = spaces.GPU
+except ImportError:        # local run / CI
+    def gpu_task(fn):
+        return fn
+
 MODEL_REPO = os.environ.get('MEDAI_MODEL_REPO', 'nebulaae/medai-thyroid')
 CKPT_FILE = os.environ.get('MEDAI_CKPT_FILE', 'medai_final.pth')
 LOCAL_CKPT = os.environ.get('MEDAI_CKPT', os.path.join('checkpoints', 'medai_final.pth'))
@@ -42,9 +49,10 @@ def _resolve_ckpt():
 
 def load():
     path = _resolve_ckpt()
-    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
-    model = MultimodalTransformer(ckpt['cfg'], pretrained=False).to(DEVICE)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    model = MultimodalTransformer(ckpt['cfg'], pretrained=False)
     model.load_state_dict(ckpt['model_state'])
+    model.to(DEVICE)
     model.eval()
     deploy = ckpt.get('deploy', {})
     return model, ckpt['cfg'], deploy
@@ -67,6 +75,7 @@ def _to_rgb(x):
     return Image.open(x).convert('RGB')
 
 
+@gpu_task
 def analyse(us_image, patch_files):
     if us_image is None:
         raise gr.Error('Please upload the ultrasound image.')

@@ -9,7 +9,7 @@ deploy/publish.py — package and publish the MedAI MVP to Hugging Face.
 Prerequisite: `hf auth login` (or HF_TOKEN) with a write token, done by the user.
 
 Usage:
-  python deploy/publish.py --user <hf-username> [--private] [--examples deploy/examples] [--dry_run]
+  python deploy/publish.py [--login] [--user <hf-username>] [--private] [--examples deploy/examples] [--dry_run]
 """
 
 import os, sys, json, shutil, argparse
@@ -17,9 +17,8 @@ import os, sys, json, shutil, argparse
 import pandas as pd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SPACE_REQUIREMENTS = """--extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu
-torchvision==0.20.1+cpu
+SPACE_REQUIREMENTS = """torch==2.5.1
+torchvision==0.20.1
 numpy<2.2
 pillow
 huggingface_hub
@@ -32,7 +31,6 @@ colorFrom: indigo
 colorTo: red
 sdk: gradio
 sdk_version: 5.9.1
-python_version: "3.11"
 app_file: app.py
 pinned: false
 short_description: US + cytology fusion for benign vs PTC (research demo)
@@ -97,13 +95,14 @@ def build_space(out_dir, model_repo, examples):
                       f"os.environ.get('MEDAI_MODEL_REPO', '{model_repo}')")
     with open(os.path.join(out_dir, 'app.py'), 'w', encoding='utf-8') as fh:
         fh.write(app)
-    print(f"Space bundle → {out_dir}")
+    print(f"Space bundle -> {out_dir}")
     return out_dir
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--user', required=True, help='Hugging Face username or organisation')
+    ap.add_argument('--user', default=None, help='Hugging Face username (default: the logged-in account)')
+    ap.add_argument('--login', action='store_true', help='Prompt for a token in this terminal first')
     ap.add_argument('--model_name', default='medai-thyroid')
     ap.add_argument('--space_name', default='medai-thyroid-demo')
     ap.add_argument('--ckpt', default=os.path.join(ROOT, 'checkpoints', 'medai_final.pth'))
@@ -112,6 +111,12 @@ def main():
     ap.add_argument('--dry_run', action='store_true', help='Build dist/hf_space without uploading')
     args = ap.parse_args()
 
+    if args.login:
+        from huggingface_hub import login
+        login()   # interactive prompt; the token is typed by the user and cached locally
+    if args.user is None:
+        from huggingface_hub import HfApi
+        args.user = HfApi().whoami()['name']
     model_repo = f"{args.user}/{args.model_name}"
     space_repo = f"{args.user}/{args.space_name}"
     out_dir = build_space(os.path.join(ROOT, 'dist', 'hf_space'), model_repo, args.examples)
