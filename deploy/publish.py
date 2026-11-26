@@ -17,8 +17,8 @@ import os, sys, json, shutil, argparse
 import pandas as pd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SPACE_REQUIREMENTS = """torch==2.5.1
-torchvision==0.20.1
+SPACE_REQUIREMENTS = """torch==2.8.0
+torchvision==0.23.0
 numpy<2.2
 pillow
 huggingface_hub
